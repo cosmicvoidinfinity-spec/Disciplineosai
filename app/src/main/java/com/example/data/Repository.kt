@@ -1,10 +1,28 @@
 package com.example.data
 
+import android.util.Log
+import com.google.android.gms.tasks.Task as GmsTask
+import com.google.firebase.FirebaseApp
+import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+// Await extension for Firebase Tasks to integrate nicely with suspended coroutines
+private suspend fun <T> GmsTask<T>.await(): T = suspendCancellableCoroutine { continuation ->
+    addOnCompleteListener { task ->
+        if (task.isSuccessful) {
+            continuation.resume(task.result)
+        } else {
+            continuation.resumeWithException(task.exception ?: Exception("Task failed"))
+        }
+    }
+}
 
 class DisciplineRepository(private val dao: DisciplineDao) {
 
@@ -72,36 +90,232 @@ class DisciplineRepository(private val dao: DisciplineDao) {
     suspend fun completeHabit(habit: Habit) {
         val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         val dates = habit.completedDates.split(";").filter { it.isNotEmpty() }.toMutableList()
+        val isChecking = !dates.contains(today)
         
-        if (dates.contains(today)) {
+        val updated = if (!isChecking) {
             // Uncheck
             dates.remove(today)
-            val updated = habit.copy(
+            val newStreak = calculateStreak(dates)
+            val updatedHabit = habit.copy(
                 completedDates = dates.joinToString(";"),
-                currentStreak = (habit.currentStreak - 1).coerceAtLeast(0)
+                currentStreak = newStreak
             )
-            dao.insertHabit(updated)
+            dao.insertHabit(updatedHabit)
             addXpAndScore(-20, -2)
+            updatedHabit
         } else {
             // Check
             dates.add(today)
-            val updated = habit.copy(
+            val newStreak = calculateStreak(dates)
+            val updatedHabit = habit.copy(
                 completedDates = dates.joinToString(";"),
-                currentStreak = habit.currentStreak + 1
+                currentStreak = newStreak
             )
-            dao.insertHabit(updated)
+            dao.insertHabit(updatedHabit)
             addXpAndScore(40, 5)
             updateChallengeByIncrement("Complete 3 Habits")
+            updatedHabit
         }
+        syncSingleHabitToFirestore(updated)
     }
 
     suspend fun createHabit(name: String, difficulty: String) {
-        dao.insertHabit(Habit(name = name, difficulty = difficulty))
+        val newHabit = Habit(name = name, difficulty = difficulty)
+        dao.insertHabit(newHabit)
         addXpAndScore(15, 0)
+        
+        // Retrieve newly created/flowed items and push to Firestore
+        val list = dao.getAllHabits().firstOrNull() ?: emptyList()
+        val match = list.firstOrNull { it.name == name && it.difficulty == difficulty }
+        if (match != null) {
+            syncSingleHabitToFirestore(match)
+        } else {
+            syncAllHabitsToFirestore()
+        }
     }
 
     suspend fun deleteHabit(habit: Habit) {
         dao.deleteHabit(habit)
+        val firestore = getSafeFirestore() ?: return
+        try {
+            firestore.collection("users")
+                .document("default_user")
+                .collection("habits")
+                .document(habit.id.toString())
+                .delete()
+                .await()
+            Log.d("FirestoreSync", "Habit successfully deleted from Firestore.")
+        } catch (e: Exception) {
+            Log.e("FirestoreSync", "Error deleting habit from Firestore: ${e.message}")
+        }
+    }
+
+    suspend fun checkAndPerformDailyReset(force: Boolean = false) {
+        val currentProgress = dao.getUserProgress().firstOrNull() ?: return
+        val lastActiveMillis = currentProgress.lastActive
+        
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+        val lastActiveDate = sdf.format(Date(lastActiveMillis))
+        val todayDate = sdf.format(Date())
+        
+        if (force || lastActiveDate != todayDate) {
+            // Yes, standard daily reset transitions water and focus seconds back to zero
+            val updatedProgress = currentProgress.copy(
+                waterIntake = 0,
+                focusSecondsToday = 0,
+                lastActive = System.currentTimeMillis()
+            )
+            dao.insertUserProgress(updatedProgress)
+            
+            val habitsList = dao.getAllHabits().firstOrNull() ?: emptyList()
+            for (h in habitsList) {
+                val dates = h.completedDates.split(";").filter { it.isNotEmpty() }
+                val newStreak = calculateStreak(dates)
+                if (h.currentStreak != newStreak) {
+                    val updatedh = h.copy(currentStreak = newStreak)
+                    dao.insertHabit(updatedh)
+                }
+            }
+            
+            // Push reset state to Firestore!
+            syncAllHabitsToFirestore()
+        }
+    }
+
+    // --- Firestore Synchronisation Domain & Utility Layer ---
+
+    private fun getSafeFirestore(): FirebaseFirestore? {
+        return try {
+            FirebaseFirestore.getInstance()
+        } catch (e: IllegalStateException) {
+            Log.d("FirestoreSync", "FirebaseApp not configured. Synchronising locally only.")
+            null
+        } catch (e: Exception) {
+            Log.e("FirestoreSync", "Firebase not available: ${e.message}")
+            null
+        }
+    }
+
+    suspend fun syncAllHabitsToFirestore() {
+        val firestore = getSafeFirestore() ?: return
+        try {
+            val habitsList = dao.getAllHabits().firstOrNull() ?: emptyList()
+            for (h in habitsList) {
+                val data = mapOf(
+                    "id" to h.id,
+                    "name" to h.name,
+                    "difficulty" to h.difficulty,
+                    "currentStreak" to h.currentStreak,
+                    "completedDates" to h.completedDates
+                )
+                firestore.collection("users")
+                    .document("default_user")
+                    .collection("habits")
+                    .document(h.id.toString())
+                    .set(data)
+                    .await()
+            }
+            Log.d("FirestoreSync", "Bulk synchronised ${habitsList.size} habits to Firestore successfully.")
+        } catch (e: Exception) {
+            Log.e("FirestoreSync", "Bulk Firestore push failed: ${e.message}")
+        }
+    }
+
+    suspend fun syncSingleHabitToFirestore(h: Habit) {
+        val firestore = getSafeFirestore() ?: return
+        try {
+            val data = mapOf(
+                "id" to h.id,
+                "name" to h.name,
+                "difficulty" to h.difficulty,
+                "currentStreak" to h.currentStreak,
+                "completedDates" to h.completedDates
+            )
+            firestore.collection("users")
+                .document("default_user")
+                .collection("habits")
+                .document(h.id.toString())
+                .set(data)
+                .await()
+            Log.d("FirestoreSync", "Saved single habit to Firestore: ${h.name}")
+        } catch (e: Exception) {
+            Log.e("FirestoreSync", "Error saving single habit to Firestore: ${e.message}")
+        }
+    }
+
+    suspend fun pullHabitsFromFirestore(): Boolean {
+        val firestore = getSafeFirestore() ?: return false
+        try {
+            val snapshot = firestore.collection("users")
+                .document("default_user")
+                .collection("habits")
+                .get()
+                .await()
+            
+            for (doc in snapshot.documents) {
+                val idLong = doc.getLong("id") ?: continue
+                val id = idLong.toInt()
+                val name = doc.getString("name") ?: ""
+                val difficulty = doc.getString("difficulty") ?: "Medium"
+                val currentStreakLong = doc.getLong("currentStreak") ?: 0L
+                val currentStreak = currentStreakLong.toInt()
+                val completedDates = doc.getString("completedDates") ?: ""
+                
+                val pulledHabit = Habit(
+                    id = id,
+                    name = name,
+                    difficulty = difficulty,
+                    currentStreak = currentStreak,
+                    completedDates = completedDates
+                )
+                dao.insertHabit(pulledHabit)
+            }
+            Log.d("FirestoreSync", "Pulled habits from Firestore successfully.")
+            return true
+        } catch (e: Exception) {
+            Log.e("FirestoreSync", "Firestore pull failed: ${e.message}")
+            return false
+        }
+    }
+
+    fun calculateStreak(completedDates: List<String>): Int {
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+        val distinctSorted = completedDates
+            .distinct()
+            .mapNotNull { try { sdf.parse(it) } catch(e: Exception) { null } }
+            .sortedDescending() // newest execution dates first
+        
+        if (distinctSorted.isEmpty()) return 0
+        
+        val today = sdf.parse(sdf.format(Date())) ?: return 0
+        
+        // Most recent completion day offset relative to actual today date
+        val first = distinctSorted.first()
+        val diffToday = (today.time - first.time) / (1000 * 60 * 60 * 24)
+        
+        if (diffToday > 1) {
+            // Gap since most recent execution exceeds active day threshold
+            return 0
+        }
+        
+        var currentStreak = 0
+        var expectedTime = first.time
+        
+        for (date in distinctSorted) {
+            val diff = (expectedTime - date.time) / (1000 * 60 * 60 * 24)
+            if (diff == 0L) {
+                currentStreak++
+                // Expect consecutive previous calendar date sequence
+                val cal = java.util.Calendar.getInstance()
+                cal.time = Date(expectedTime)
+                cal.add(java.util.Calendar.DATE, -1)
+                expectedTime = cal.timeInMillis
+            } else if (diff > 0L) {
+                // Non-sequential gap detected, streak segment complete
+                break
+            }
+        }
+        return currentStreak
     }
 
     suspend fun createTask(title: String, description: String, priority: String, category: String) {

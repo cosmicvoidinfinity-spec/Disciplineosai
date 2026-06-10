@@ -61,6 +61,7 @@ class DisciplineViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             // Retrieve or trigger Initial Seed
             repository.getOrCreateUserProgress()
+            repository.checkAndPerformDailyReset()
             resetCoachMessages()
         }
     }
@@ -103,6 +104,28 @@ class DisciplineViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun simulateDayReset() {
+        viewModelScope.launch {
+            // Setup a previous active status so we transition into a new day's constraints
+            val progress = repository.getOrCreateUserProgress()
+            val cal = java.util.Calendar.getInstance()
+            cal.add(java.util.Calendar.DATE, -1)
+            val yesterdayMillis = cal.timeInMillis
+            
+            // Re-insert stating that we were last active yesterday with water logged, so we can prove it clears
+            _isCoachTyping.value = true // Show a brief activity indicator
+            db.dao().insertUserProgress(progress.copy(
+                lastActive = yesterdayMillis,
+                waterIntake = 1800,
+                focusSecondsToday = 3600
+            ))
+            
+            // Execute the evaluation logic
+            repository.checkAndPerformDailyReset(force = true)
+            _isCoachTyping.value = false
+        }
+    }
+
     fun completeHabit(habit: Habit) {
         viewModelScope.launch {
             repository.completeHabit(habit)
@@ -118,6 +141,28 @@ class DisciplineViewModel(application: Application) : AndroidViewModel(applicati
     fun deleteHabit(habit: Habit) {
         viewModelScope.launch {
             repository.deleteHabit(habit)
+        }
+    }
+
+    fun syncHabitsWithFirestore() {
+        viewModelScope.launch {
+            repository.syncAllHabitsToFirestore()
+        }
+    }
+
+    fun pullHabitsFromFirestore(onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val res = repository.pullHabitsFromFirestore()
+            onResult(res)
+        }
+    }
+
+    fun isFirestoreConfigured(): Boolean {
+        return try {
+            com.google.firebase.FirebaseApp.getInstance()
+            true
+        } catch (e: Exception) {
+            false
         }
     }
 
