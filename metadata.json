@@ -1,0 +1,6 @@
+{
+  "name": "DisciplineOS AI",
+  "description": "An AI-powered Life Operating System combining habit tracking, tasks, notes, nutrition, and an interactive AI discipline coach.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
